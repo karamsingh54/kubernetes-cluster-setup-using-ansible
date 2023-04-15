@@ -1,0 +1,160 @@
+---
+- name: Cluster k8s setup
+   hosts: all
+   tasks:
+          - name: Change the hostname to our standard
+            ansible.builtin.hostname:
+                    name: "{{ hostname }}"
+
+          - name: download script for docker
+            shell: curl -fsSL https://get.docker.com -o get-docker.sh | bash -
+
+          - name: running script
+            command: bash /home/ubuntu/get-docker.sh
+
+          - name: create daemon.json file
+            file:
+                    path: /etc/docker/daemon.json
+                    state: touch
+
+          - name: entry in daemon.json file
+            blockinfile:
+                    path: /etc/docker/daemon.json
+                    block: |
+                          {
+                                  "exec-opts":["native.cgroupdriver=systemd"]
+                          }
+                    marker: ""
+
+          - name: restart docker service
+            service:
+                    name: docker
+                    state: restarted
+
+          - name: config.toml file
+            blockinfile:
+                    path: /etc/containerd/config.toml
+                    block: |
+                           version = 2
+                           [plugins]
+                           [plugins."io.containerd.grpc.v1.cri"]
+                           [plugins."io.containerd.grpc.v1.cri".containerd]
+                           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                           runtime_type = "io.containerd.runc.v2"
+                           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                           SystemdCgroup = true
+                    marker: ""
+
+          - name: Comment out the line
+            lineinfile:
+                    path: /etc/containerd/config.toml
+                    line: disabled_plugins = ["cri"]
+                    state: absent
+
+          - name: restart containerd service
+            service:
+                    name: containerd
+                    state: restarted
+
+          - name: install cri plugins
+            command: git clone https://github.com/Mirantis/cri-dockerd.git
+
+          - name: compile cri plugins
+            shell: |
+                    # Run these commands as root
+                    ###Install GO###
+                    wget https://storage.googleapis.com/golang/getgo/installer_linux
+                    chmod +x ./installer_linux
+                    ./installer_linux
+                    source ~/.bash_profile
+
+                    cd cri-dockerd
+                    mkdir bin
+                    go build -o bin/cri-dockerd
+                    mkdir -p /usr/local/bin
+                    install -o root -g root -m 0755 bin/cri-dockerd /usr/local/bin/cri-dockerd
+                    cp -a packaging/systemd/* /etc/systemd/system
+                    sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+                    systemctl daemon-reload
+                    systemctl enable cri-docker.service
+                    systemctl enable --now cri-docker.socket
+
+          - name: install and configure dependencies
+            shell: |
+                   apt-get update && apt-get install -y apt-transport-https ca-certificates curl
+                   curl -fsSLo /etc/apt/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.
+
+          - name: add kubernates repository
+            shell: |
+                   echo "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xeources.list.d/kubernetes.list
+
+          - name: install kubernates packages
+            shell: |
+                   apt-get update
+                   apt-get install -y kubelet kubeadm kubectl
+                   apt-mark hold kubelet kubeadm kubectl
+---
+- name: configuration in master-node
+   hosts: master
+   tasks:
+        - name: initialize master machine
+          shell: |
+                   kubeadm init --cri-socket unix:///var/run/containerd/containerd.sock
+
+        - name: create join token
+          shell: kubeadm token create --print-join-command
+          register: kubernetes_join_command
+
+        - debug:
+             msg: "{{ kubernetes_join_command.stdout }}"
+
+        - name: Copy join command to local file.
+          local_action: copy content="{{ kubernetes_join_command.stdout_lines[0] }} --cri-socket unix:///var/run/containerd/contai_join_command" mode=0777
+
+
+- name: permission
+  hosts: master
+  tasks:
+     - name: copy command in .bash_profile
+       lineinfile:
+            path: /root/.bash_profile
+            line: export KUBECONFIG=/etc/kubernetes/admin.conf
+            state: present
+
+     - name: reboot the server
+       reboot:
+            connect_timeout: 500
+
+
+     - name: install calico plugin
+       shell: |
+              curl  https://raw.githubusercontent.com/projectcalico/calico/v3.25.1/manifests/calico.yaml -O
+
+
+
+     - name: adding admin.config file to .kube directory
+       shell: |
+               mkdir -p $HOME/.kube
+               sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+               sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+     - name: wait for update
+       shell: |
+               sleep 20
+     - name: apply calico file
+       command: kubectl apply -f /home/ubuntu/calico.yaml
+
+
+- name: configuration in worker-node
+   hosts: worker
+   tasks:
+      - name: Copy join command from Ansiblehost to the worker nodes.
+        copy:
+            src: /tmp/kubernetes_join_command
+            dest: /tmp/kubernetes_join_command
+            mode: 0777
+
+      - name: Join the Worker nodes to the cluster
+        command: bash /tmp/kubernetes_join_command
+
